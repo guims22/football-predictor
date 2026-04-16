@@ -1,0 +1,15 @@
+# Environment
+backend/.env
+**/__pycache__/
+**/*.pyc
+backend/.venv/
+backend/venv/
+
+# Mobile
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+
+# ML models (trop grands pour GitHub)
+backend/models/xgboost_model.pkl
+backend/models/training_data.json
