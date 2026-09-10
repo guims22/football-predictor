@@ -157,6 +157,41 @@ export interface Competition {
   type: string;
 }
 
+/**
+ * Classement d'une competition.
+ *
+ * Le tableau `standings` contient plusieurs blocs : un seul pour un championnat
+ * (TOTAL / REGULAR_SEASON), un par groupe pour une coupe. On affiche donc chaque
+ * bloc avec son intitule plutot que de supposer qu'il n'y en a qu'un.
+ */
+export interface StandingRow {
+  position: number;
+  team: { id: number; name: string; shortName: string; tla: string; crest: string };
+  playedGames: number;
+  won: number;
+  draw: number;
+  lost: number;
+  points: number;
+  goalsFor: number;
+  goalsAgainst: number;
+  goalDifference: number;
+  form?: string | null;
+}
+
+export interface StandingBlock {
+  stage?: string;
+  type?: string;
+  group?: string | null;
+  table: StandingRow[];
+}
+
+export interface StandingsResponse {
+  competition: { id: number; name: string; code: string; emblem: string };
+  area?: { name: string; flag?: string };
+  season?: { startDate: string; endDate: string; currentMatchday?: number };
+  standings: StandingBlock[];
+}
+
 export interface Health {
   status: "ok" | "degraded";
   degraded: string[];
@@ -213,7 +248,8 @@ export const getFullPrediction = (params: PredictionParams) =>
 export const getCompetitions = () =>
   api.get<{ competitions: Competition[]; count: number }>("/leagues/");
 
-export const getStandings = (code: string) => api.get(`/leagues/${code}/standings`);
+export const getStandings = (code: string) =>
+  api.get<StandingsResponse>(`/leagues/${code}/standings`);
 
 export const askAnalyst = (question: string, history: { role: "user" | "assistant"; content: string }[] = []) =>
   api.post<{ response: string }>("/analysis/chat", { question, history });

@@ -175,7 +175,10 @@ export default function PredictionsScreen() {
           {/* Confidence */}
           <View style={s.confidenceBox}>
             <Text style={s.confidenceLabel}>Confiance de l'IA</Text>
-            <Text style={s.confidenceValue}>{data.prediction.confidence}%</Text>
+            <View style={{ alignItems: "flex-end" }}>
+              <Text style={s.confidenceValue}>{data.prediction.confidence}%</Text>
+              <Text style={s.methodText}>{data.prediction.method}</Text>
+            </View>
           </View>
 
           {/* Probabilities */}
@@ -224,6 +227,91 @@ export default function PredictionsScreen() {
             </View>
           </View>
 
+
+          {/* Types de paris -- calcules par le backend, jamais affiches jusqu'ici */}
+          <View style={s.card}>
+            <Text style={s.cardTitle}>Autres paris</Text>
+            <View style={s.betGrid}>
+              {[
+                { l: "Les deux marquent", v: data.prediction.btts },
+                { l: "Plus de 1,5 but", v: data.prediction.over_1_5 },
+                { l: "Plus de 2,5 buts", v: data.prediction.over_2_5 },
+                { l: "Plus de 3,5 buts", v: data.prediction.over_3_5 },
+              ].map((b) => (
+                <View key={b.l} style={s.betItem}>
+                  <Text style={[s.betPct, b.v >= 0.6 && { color: C.win }]}>
+                    {Math.round(b.v * 100)}%
+                  </Text>
+                  <Text style={s.betLabel}>{b.l}</Text>
+                </View>
+              ))}
+            </View>
+            <Text style={s.xgLine}>
+              Buts attendus : {data.home_team} {data.prediction.home_xg} · {data.away_team}{" "}
+              {data.prediction.away_xg}
+            </Text>
+          </View>
+
+          {/* Analyse de value : ecart entre notre probabilite et celle du marche.
+              C'est la seule information reellement exploitable pour parier --
+              suivre le marche ne bat jamais le marche. */}
+          {data.prediction.value_analysis ? (
+            <View style={s.card}>
+              <Text style={s.cardTitle}>Value contre les bookmakers</Text>
+              {(
+                [
+                  ["home_win", `Victoire ${data.home_team}`],
+                  ["draw", "Match nul"],
+                  ["away_win", `Victoire ${data.away_team}`],
+                ] as const
+              ).map(([k, label]) => {
+                const v = data.prediction.value_analysis?.[k];
+                if (!v) return null;
+                const positive = v.edge > 0;
+                return (
+                  <View key={k} style={s.valueRow}>
+                    <Text style={s.valueLabel} numberOfLines={1}>{label}</Text>
+                    <Text style={s.valueCell}>{Math.round(v.model_prob * 100)}%</Text>
+                    <Text style={s.valueCellDim}>{Math.round(v.market_prob * 100)}%</Text>
+                    <Text style={[s.valueEdge, { color: positive ? C.win : C.muted }]}>
+                      {positive ? "+" : ""}
+                      {Math.round(v.edge * 100)} pts
+                    </Text>
+                    {v.value_bet ? <Text style={s.valueFlag}>VALUE</Text> : null}
+                  </View>
+                );
+              })}
+              <View style={s.valueLegend}>
+                <Text style={s.valueLegendText}>
+                  Colonnes : notre probabilite · celle du marche · ecart. Un ecart positif
+                  signale un pari potentiellement sous-cote. Ce n'est pas une garantie de gain.
+                </Text>
+              </View>
+            </View>
+          ) : null}
+
+          {/* Classement : le backend le calculait deja, il n'etait jamais montre */}
+          {data.standings &&
+          (data.standings.home_position || data.standings.away_position) ? (
+            <View style={s.card}>
+              <Text style={s.cardTitle}>Classement</Text>
+              <View style={s.h2hRow}>
+                <View style={s.h2hItem}>
+                  <Text style={[s.h2hVal, { color: C.primary }]}>
+                    {data.standings.home_position ?? "-"}
+                  </Text>
+                  <Text style={s.h2hLabel} numberOfLines={1}>{data.home_team}</Text>
+                </View>
+                <View style={s.h2hItem}>
+                  <Text style={[s.h2hVal, { color: C.primary }]}>
+                    {data.standings.away_position ?? "-"}
+                  </Text>
+                  <Text style={s.h2hLabel} numberOfLines={1}>{data.away_team}</Text>
+                </View>
+              </View>
+            </View>
+          ) : null}
+
           {/* Claude Analysis */}
           <View style={[s.card, s.analysisCard]}>
             <View style={s.analysisHeader}>
@@ -260,6 +348,20 @@ const s = StyleSheet.create({
   confidenceBox: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: C.accent + "33", borderRadius: 12, padding: 14, marginBottom: 12, borderWidth: 1, borderColor: C.accent + "66" },
   confidenceLabel: { color: C.text, fontWeight: "600" },
   confidenceValue: { color: C.primary, fontSize: 20, fontWeight: "900" },
+  betGrid: { flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between" },
+  betItem: { width: "48%", backgroundColor: C.bg, borderRadius: 12, paddingVertical: 12, alignItems: "center", marginBottom: 8, borderWidth: 1, borderColor: C.border },
+  betPct: { color: C.text, fontSize: 18, fontWeight: "800" },
+  betLabel: { color: C.muted, fontSize: 11, marginTop: 3, textAlign: "center" },
+  xgLine: { color: C.muted, fontSize: 11, textAlign: "center", marginTop: 6 },
+  valueRow: { flexDirection: "row", alignItems: "center", paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C.border },
+  valueLabel: { flex: 1, color: C.text, fontSize: 12, fontWeight: "600" },
+  valueCell: { width: 46, textAlign: "center", color: C.text, fontSize: 12, fontWeight: "700" },
+  valueCellDim: { width: 46, textAlign: "center", color: C.muted, fontSize: 12 },
+  valueEdge: { width: 62, textAlign: "right", fontSize: 12, fontWeight: "700" },
+  valueFlag: { marginLeft: 6, color: "#04220f", backgroundColor: C.win, fontSize: 9, fontWeight: "900", paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4, overflow: "hidden" },
+  valueLegend: { marginTop: 10 },
+  valueLegendText: { color: C.muted, fontSize: 10, lineHeight: 15 },
+  methodText: { color: C.muted, fontSize: 9, marginTop: 2 },
   card: { backgroundColor: C.card, borderRadius: 16, padding: 16, marginBottom: 12, borderWidth: 1, borderColor: C.border },
   cardTitle: { color: C.text, fontSize: 15, fontWeight: "700", marginBottom: 14 },
   statsGrid: { marginTop: 12, borderTopWidth: 1, borderTopColor: C.border, paddingTop: 12 },

@@ -10,7 +10,7 @@ import {
   Image,
 } from "react-native";
 import { useRouter } from "expo-router";
-import { getCompetitions, Competition } from "../../services/api";
+import { getCompetitions, describeError, Competition } from "../../services/api";
 
 const C = {
   bg: "#0a1628",
@@ -24,12 +24,18 @@ const C = {
 export default function LeaguesScreen() {
   const [competitions, setCompetitions] = useState<Competition[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const router = useRouter();
 
   useEffect(() => {
     getCompetitions()
-      .then((res) => setCompetitions(res.data.competitions || []))
-      .catch(() => setCompetitions([]))
+      .then((res) => {
+        setCompetitions(res.data.competitions || []);
+        setError(null);
+      })
+      // Avant : .catch(() => setCompetitions([])) -- toute panne se traduisait
+      // par une liste vide, sans dire pourquoi.
+      .catch((e) => setError(describeError(e)))
       .finally(() => setLoading(false));
   }, []);
 
@@ -38,11 +44,14 @@ export default function LeaguesScreen() {
       style={s.card}
       activeOpacity={0.8}
       onPress={() =>
+        // Renvoyait vers "/(tabs)/index", qui ne lit aucun parametre :
+        // taper un championnat n'affichait donc jamais rien.
         router.push({
-          pathname: "/(tabs)/index",
-          params: { competitionCode: item.code },
+          pathname: "/league/[code]",
+          params: { code: item.code, name: item.name },
         })
       }
+      disabled={!item.code}
     >
       {item.emblem ? (
         <Image source={{ uri: item.emblem }} style={s.emblem} />
@@ -70,6 +79,10 @@ export default function LeaguesScreen() {
         <View style={s.center}>
           <ActivityIndicator size="large" color={C.primary} />
         </View>
+      ) : error ? (
+        <View style={s.center}>
+          <Text style={s.errorText}>{error}</Text>
+        </View>
       ) : (
         <FlatList
           data={competitions}
@@ -95,5 +108,6 @@ const s = StyleSheet.create({
   name: { color: C.text, fontSize: 14, fontWeight: "700" },
   area: { color: C.muted, fontSize: 12, marginTop: 3 },
   arrow: { color: C.primary, fontSize: 24, fontWeight: "300" },
-  center: { flex: 1, justifyContent: "center", alignItems: "center" },
+  center: { flex: 1, justifyContent: "center", alignItems: "center", padding: 24 },
+  errorText: { color: "#ff5252", fontSize: 14, textAlign: "center" },
 });

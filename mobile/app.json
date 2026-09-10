@@ -2,7 +2,7 @@
   "expo": {
     "name": "Football Predictor",
     "slug": "football-predictor",
-    "version": "2.0.0",
+    "version": "2.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "footballpredictor",
@@ -28,7 +28,7 @@
       },
       "package": "com.footballpredictor.app",
       "usesCleartextTraffic": true,
-      "versionCode": 2
+      "versionCode": 3
     },
     "web": {
       "bundler": "metro",

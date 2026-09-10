@@ -11,7 +11,12 @@ import {
   Image,
 } from "react-native";
 import { useRouter } from "expo-router";
-import { getMatchesToday, getUpcomingMatches, Match } from "../../services/api";
+import {
+  getMatchesToday,
+  getUpcomingMatches,
+  describeError,
+  Match,
+} from "../../services/api";
 
 const C = {
   bg: "#0a1628",
@@ -30,6 +35,7 @@ export default function MatchesScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [tab, setTab] = useState<Tab>("today");
+  const [error, setError] = useState<string | null>(null);
   const router = useRouter();
 
   const fetchMatches = useCallback(async () => {
@@ -39,7 +45,12 @@ export default function MatchesScreen() {
           ? await getMatchesToday()
           : await getUpcomingMatches(7);
       setMatches(res.data.matches || []);
-    } catch {
+      setError(null);
+    } catch (e) {
+      // Avant : `catch { setMatches([]) }`. Panne reseau, cle refusee, serveur
+      // endormi : tout s'affichait "Aucun match disponible", ce qui rendait
+      // le moindre diagnostic impossible depuis le telephone.
+      setError(describeError(e));
       setMatches([]);
     } finally {
       setLoading(false);
@@ -181,6 +192,13 @@ export default function MatchesScreen() {
           <ActivityIndicator size="large" color={C.primary} />
           <Text style={styles.loadingText}>Chargement des matchs...</Text>
         </View>
+      ) : error ? (
+        <View style={styles.center}>
+          <Text style={styles.errorText}>{error}</Text>
+          <TouchableOpacity style={styles.retry} onPress={onRefresh} activeOpacity={0.8}>
+            <Text style={styles.retryText}>Reessayer</Text>
+          </TouchableOpacity>
+        </View>
       ) : matches.length === 0 ? (
         <View style={styles.center}>
           <Text style={styles.emptyText}>Aucun match disponible</Text>
@@ -229,5 +247,8 @@ const styles = StyleSheet.create({
   predictBtnText: { color: C.primary, fontSize: 13, fontWeight: "700" },
   center: { flex: 1, justifyContent: "center", alignItems: "center" },
   loadingText: { color: C.muted, marginTop: 12 },
+  errorText: { color: "#ff5252", fontSize: 14, textAlign: "center", marginBottom: 14, paddingHorizontal: 24 },
+  retry: { backgroundColor: "#00c853", paddingHorizontal: 22, paddingVertical: 10, borderRadius: 10 },
+  retryText: { color: "#04220f", fontWeight: "800" },
   emptyText: { color: C.muted, fontSize: 16 },
 });
