@@ -145,9 +145,33 @@ async def _get(path: str, params: dict = None, cache_key: str = None, ttl: int =
 # --- endpoints ---------------------------------------------------------------
 
 async def get_today_matches():
-    today = date.today().isoformat()
-    return await _get("/matches", {"dateFrom": today, "dateTo": today},
-                      cache_key=f"today_{today}", ttl=900)
+    """
+    Matchs du jour.
+
+    CORRECTIF : football-data.org renvoie une liste VIDE quand dateFrom et dateTo
+    sont identiques -- verifie directement contre l'API :
+        dateFrom=2026-09-10 & dateTo=2026-09-10 -> 0 match
+        dateFrom=2026-09-10 & dateTo=2026-09-11 -> 8 matchs, tous le 10
+    L'ecran d'accueil affichait donc "Aucun match disponible" en permanence,
+    depuis la toute premiere version.
+
+    On demande donc un jour de plus, puis on refiltre sur la date du jour --
+    l'intervalle elargi peut ramener des matchs de nuit rattaches au lendemain.
+    """
+    today = date.today()
+    today_iso = today.isoformat()
+    tomorrow_iso = (today + timedelta(days=1)).isoformat()
+
+    data = await _get(
+        "/matches",
+        {"dateFrom": today_iso, "dateTo": tomorrow_iso},
+        cache_key=f"today_{today_iso}",
+        ttl=900,
+    )
+
+    matches = [m for m in data.get("matches", [])
+               if (m.get("utcDate") or "").startswith(today_iso)]
+    return {**data, "matches": matches, "count": len(matches)}
 
 
 async def get_upcoming_matches(days: int = 7):

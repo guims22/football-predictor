@@ -24,3 +24,7 @@ backend/models/training_data.json
 
 # Cle d acces generee localement -- NE JAMAIS PUBLIER
 backend/.api_access_key.tmp
+
+# Projet natif Android genere par "expo prebuild" -- regenerable, ne pas versionner
+mobile/android/
+mobile/ios/
