@@ -9,7 +9,12 @@ import {
   TouchableOpacity,
 } from "react-native";
 import { useLocalSearchParams } from "expo-router";
-import { getFullPrediction, FullPrediction, TeamForm } from "../../services/api";
+import {
+  getFullPrediction,
+  describeError,
+  FullPrediction,
+  TeamForm,
+} from "../../services/api";
 
 const C = {
   bg: "#0a1628",
@@ -85,6 +90,8 @@ export default function PredictionsScreen() {
     homeName: string;
     awayName: string;
     competition: string;
+    competitionCode: string;
+    matchDate: string;
   }>();
 
   const [data, setData] = useState<FullPrediction | null>(null);
@@ -105,10 +112,12 @@ export default function PredictionsScreen() {
         home_team_name: params.homeName!,
         away_team_name: params.awayName!,
         competition: params.competition || "",
+        competition_code: params.competitionCode || "",
+        match_date: params.matchDate || "",
       });
       setData(res.data);
     } catch (e: any) {
-      setError(e?.message || "Erreur de chargement");
+      setError(describeError(e));
     } finally {
       setLoading(false);
     }

@@ -94,6 +94,10 @@ export default function MatchesScreen() {
               homeName: item.homeTeam.name,
               awayName: item.awayTeam.name,
               competition: item.competition.name,
+              // Sans le code de ligue, le backend ne peut recuperer ni les cotes
+              // ni le classement : les deux passaient silencieusement a la trappe.
+              competitionCode: item.competition.code ?? "",
+              matchDate: item.utcDate,
             },
           })
         }

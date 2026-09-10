@@ -1,7 +1,17 @@
-fastapi==0.111.0
-uvicorn==0.30.1
-httpx==0.27.0
+# --- API ---
+fastapi==0.141.1
+uvicorn[standard]==0.34.0
+httpx==0.28.1
 python-dotenv==1.0.1
-anthropic==0.28.0
+
+# --- Claude ---
+anthropic>=1.0.0,<2.0.0
+
+# --- ML --- versions IDENTIQUES a celles qui ont produit xgboost_model.pkl :
+# un pickle XGBoost ne se recharge pas de facon fiable sur une version differente.
+xgboost==3.2.0
 scikit-learn==1.5.0
 numpy==1.26.4
+
+# --- TLS : indispensable derriere un antivirus qui intercepte le HTTPS (AVG/Avast/Kaspersky) ---
+truststore==0.10.1

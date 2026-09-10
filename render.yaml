@@ -1,0 +1,42 @@
+# Configuration Render (https://render.com) -- offre gratuite.
+#
+# Utilisation : sur render.com -> New + -> Blueprint -> choisir le depot
+# guims22/football-predictor. Render lit ce fichier et cree le service seul.
+# Il demandera ensuite les 4 valeurs marquees "sync: false" (les secrets ne sont
+# jamais ecrits dans le depot).
+#
+# Limite de l'offre gratuite : le service s'endort apres 15 minutes sans requete.
+# La requete suivante le reveille et prend environ 50 secondes. Ensuite tout est
+# rapide. C'est le seul inconvenient.
+
+services:
+  - type: web
+    name: football-predictor-api
+    runtime: python
+    plan: free
+    region: frankfurt          # le plus proche du Cameroun parmi les regions gratuites
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Doit rester 3.11 : numpy 1.26.4 ne se compile pas sur 3.13,
+      # et c'est la version qui a produit le modele.
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+      # Renseignes dans l'interface Render, jamais dans le depot.
+      - key: CLAUDE_API_KEY
+        sync: false
+      - key: FOOTBALL_API_KEY
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false
+      - key: API_ACCESS_KEY
+        sync: false
+
+      # L'app mobile n'est pas un navigateur : CORS ne la concerne pas.
+      # A restreindre si un site web consomme un jour cette API.
+      - key: ALLOWED_ORIGINS
+        value: "*"

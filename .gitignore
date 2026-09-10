@@ -1,15 +1,26 @@
-# Environment
+# Environnement
 backend/.env
+mobile/.env
 **/__pycache__/
 **/*.pyc
 backend/.venv/
 backend/venv/
 
+# Bundle de certificats racine exporte du poste (machine-specifique)
+backend/corp-ca-bundle.pem
+
 # Mobile
 mobile/node_modules/
 mobile/.expo/
 mobile/dist/
+backend/.expo/
 
-# ML models (trop grands pour GitHub)
-backend/models/xgboost_model.pkl
+# Donnees d'entrainement brutes : 12 Mo, regenerables via `python -m models.train`
 backend/models/training_data.json
+
+# NOTE : xgboost_model.pkl (2.6 Mo) est VOLONTAIREMENT versionne.
+# Il etait ignore, donc Railway deployait sans modele : l'API repartait
+# silencieusement en Poisson seul et personne ne le voyait.
+
+# Cle d acces generee localement -- NE JAMAIS PUBLIER
+backend/.api_access_key.tmp

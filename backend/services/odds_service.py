@@ -1,15 +1,40 @@
-import httpx
+"""
+Client The Odds API (cotes bookmakers).
+
+Correction majeure de consommation de quota :
+  AVANT : get_odds_for_match recevait competition_code="" (les routes ne le
+  passaient jamais) et bouclait donc sur les 12 sports de la table, soit
+  12 requetes par prediction. Le quota gratuit de 500 req/mois etait epuise
+  en 41 predictions.
+
+  MAINTENANT : 1 requete par ligue, mise en cache 10 min et partagee par tous
+  les matchs de cette ligue. Une journee de championnat complete coute
+  1 requete au lieu de 120. Le quota restant est lu dans les en-tetes et
+  expose par /health.
+"""
+
 import os
 import re
+import time
+from difflib import SequenceMatcher
+
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 BASE_URL = "https://api.the-odds-api.com/v4"
-TIMEOUT = 10.0
+TIMEOUT = 12.0
+CACHE_TTL = 600          # 10 min : les cotes bougent lentement hors direct
+MIN_MATCH_SCORE = 0.62
 
-# Mapping football-data.org competition codes -> Odds API sport keys
 COMPETITION_MAP = {
     "PL":  "soccer_epl",
     "FL1": "soccer_france_ligue_one",
@@ -25,59 +50,63 @@ COMPETITION_MAP = {
     "EC":  "soccer_uefa_european_championship",
 }
 
+_odds_cache: dict = {}
+QUOTA = {"remaining": None, "used": None, "last_check": None}
+
+
+def quota_status() -> dict:
+    return dict(QUOTA)
+
+
+# --- rapprochement des noms d'equipes ----------------------------------------
+
+_NOISE = re.compile(
+    r"\b(fc|cf|sc|ac|as|ss|rc|cd|afc|fk|sk|sv|bv|vfb|vfl|fsv|tsg|ssc|us|ud|sd|cp|1)\b"
+)
+
 
 def _normalize(name: str) -> str:
-    """Normalize team name for fuzzy matching."""
-    name = name.lower()
-    name = re.sub(r"\b(fc|cf|sc|ac|as|ss|rc|cd|afc|fk|sk|sv|bv|vfb|1\.|fsv)\b", "", name)
-    name = re.sub(r"[^a-z0-9 ]", "", name)
-    return name.strip()
+    name = (name or "").lower()
+    name = name.replace("&", " and ")
+    name = re.sub(r"[^a-z0-9 ]", " ", name)
+    name = _NOISE.sub(" ", name)
+    return " ".join(name.split())
 
 
 def _similarity(a: str, b: str) -> float:
-    """Simple character overlap similarity."""
-    a, b = _normalize(a), _normalize(b)
-    if a == b:
-        return 1.0
-    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
-    if shorter in longer:
-        return 0.9
-    # Count matching words
-    words_a = set(a.split())
-    words_b = set(b.split())
-    if not words_a or not words_b:
+    """
+    Similarite de noms.
+
+    L'ancienne version renvoyait 0.9 des qu'une chaine etait incluse dans
+    l'autre : "Real Madrid" et "Real Sociedad" partagent "real", et surtout
+    "Manchester City" etait inclus dans... rien, mais "Milan" matchait
+    "Inter Milan" a 0.9. On combine desormais recouvrement de mots et
+    similarite de caracteres, ce qui separe ces cas.
+    """
+    na, nb = _normalize(a), _normalize(b)
+    if not na or not nb:
         return 0.0
+    if na == nb:
+        return 1.0
+
+    words_a, words_b = set(na.split()), set(nb.split())
     common = words_a & words_b
-    return len(common) / max(len(words_a), len(words_b))
+    word_score = len(common) / max(len(words_a), len(words_b))
+    char_score = SequenceMatcher(None, na, nb).ratio()
+    return 0.6 * word_score + 0.4 * char_score
 
 
-async def get_odds_for_match(
-    home_team: str,
-    away_team: str,
-    competition_code: str = "",
-) -> dict | None:
-    """
-    Fetch bookmaker odds for a specific match.
-    Returns implied probabilities {home_win, draw, away_win} or None.
-    """
-    sports_to_check = []
+# --- appel API ---------------------------------------------------------------
 
-    if competition_code and competition_code in COMPETITION_MAP:
-        sports_to_check.append(COMPETITION_MAP[competition_code])
-    else:
-        # Try all soccer sports
-        sports_to_check = list(COMPETITION_MAP.values())
+async def _fetch_sport_odds(sport: str):
+    """Recupere toutes les cotes d'une ligue. Mise en cache : 1 requete par ligue."""
+    entry = _odds_cache.get(sport)
+    if entry and time.time() < entry["expires"]:
+        return entry["data"]
 
-    for sport in sports_to_check:
-        result = await _fetch_odds(sport, home_team, away_team)
-        if result:
-            return result
+    if not ODDS_API_KEY:
+        return None
 
-    return None
-
-
-async def _fetch_odds(sport: str, home_team: str, away_team: str) -> dict | None:
-    """Fetch and match odds from a specific sport."""
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             r = await client.get(
@@ -87,82 +116,92 @@ async def _fetch_odds(sport: str, home_team: str, away_team: str) -> dict | None
                     "regions": "eu",
                     "markets": "h2h",
                     "oddsFormat": "decimal",
-                    "bookmakers": "bet365,pinnacle,betfair",
+                    "bookmakers": "bet365,pinnacle,betfair,williamhill",
                 },
             )
-            if r.status_code != 200:
-                return None
-            games = r.json()
-    except Exception:
+    except httpx.HTTPError:
         return None
 
-    best_match = None
-    best_score = 0.0
+    QUOTA["remaining"] = r.headers.get("x-requests-remaining")
+    QUOTA["used"] = r.headers.get("x-requests-used")
+    QUOTA["last_check"] = time.time()
 
+    if r.status_code != 200:
+        # on cache le vide pour ne pas re-bruler du quota sur une ligue morte
+        _odds_cache[sport] = {"data": [], "expires": time.time() + CACHE_TTL}
+        return []
+
+    data = r.json()
+    _odds_cache[sport] = {"data": data, "expires": time.time() + CACHE_TTL}
+    return data
+
+
+async def get_odds_for_match(home_team: str, away_team: str, competition_code: str = ""):
+    """
+    Cotes d'un match precis.
+
+    Sans code de competition connu, on renonce plutot que de balayer les
+    12 ligues : une prediction ne doit jamais couter 12 requetes de quota.
+    """
+    sport = COMPETITION_MAP.get((competition_code or "").upper())
+    if not sport:
+        return None
+
+    games = await _fetch_sport_odds(sport)
+    if not games:
+        return None
+
+    best, best_score = None, 0.0
     for game in games:
-        h_score = _similarity(game.get("home_team", ""), home_team)
-        a_score = _similarity(game.get("away_team", ""), away_team)
-        score = (h_score + a_score) / 2
+        score = (_similarity(game.get("home_team", ""), home_team)
+                 + _similarity(game.get("away_team", ""), away_team)) / 2
+        if score > best_score:
+            best_score, best = score, game
 
-        if score > best_score and score >= 0.6:
-            best_score = score
-            best_match = game
-
-    if not best_match:
+    if not best or best_score < MIN_MATCH_SCORE:
         return None
 
-    return _extract_implied_probs(best_match)
+    return _extract_implied_probs(best)
 
 
-def _extract_implied_probs(game: dict) -> dict | None:
-    """
-    Average odds across bookmakers and convert to implied probabilities.
-    Removes the overround (vigorish) via normalization.
-    """
-    home_odds_list, draw_odds_list, away_odds_list = [], [], []
+def _extract_implied_probs(game: dict):
+    """Moyenne les cotes des bookmakers et retire la marge (overround)."""
+    home_list, draw_list, away_list = [], [], []
+    h_name, a_name = game.get("home_team", ""), game.get("away_team", "")
 
     for bookie in game.get("bookmakers", []):
         for market in bookie.get("markets", []):
             if market.get("key") != "h2h":
                 continue
-            outcomes = {o["name"]: o["price"] for o in market.get("outcomes", [])}
-            h_name = game.get("home_team", "")
-            a_name = game.get("away_team", "")
-
-            # Match outcome names
-            for name, price in outcomes.items():
-                sim_h = _similarity(name, h_name)
-                sim_a = _similarity(name, a_name)
-                if name.lower() == "draw":
-                    draw_odds_list.append(price)
-                elif sim_h > sim_a and sim_h > 0.5:
-                    home_odds_list.append(price)
+            for outcome in market.get("outcomes", []):
+                name, price = outcome.get("name", ""), outcome.get("price")
+                if not price:
+                    continue
+                if name.strip().lower() == "draw":
+                    draw_list.append(price)
+                    continue
+                sim_h, sim_a = _similarity(name, h_name), _similarity(name, a_name)
+                if sim_h > sim_a and sim_h > 0.5:
+                    home_list.append(price)
                 elif sim_a > sim_h and sim_a > 0.5:
-                    away_odds_list.append(price)
+                    away_list.append(price)
 
-    if not home_odds_list or not draw_odds_list or not away_odds_list:
+    if not (home_list and draw_list and away_list):
         return None
 
-    # Average odds
-    avg_home = sum(home_odds_list) / len(home_odds_list)
-    avg_draw = sum(draw_odds_list) / len(draw_odds_list)
-    avg_away = sum(away_odds_list) / len(away_odds_list)
+    avg_h = sum(home_list) / len(home_list)
+    avg_d = sum(draw_list) / len(draw_list)
+    avg_a = sum(away_list) / len(away_list)
 
-    # Raw implied probs
-    raw_h = 1 / avg_home
-    raw_d = 1 / avg_draw
-    raw_a = 1 / avg_away
-
-    # Remove overround
+    raw_h, raw_d, raw_a = 1 / avg_h, 1 / avg_d, 1 / avg_a
     total = raw_h + raw_d + raw_a
+
     return {
         "home_win": round(raw_h / total, 3),
-        "draw":     round(raw_d / total, 3),
+        "draw": round(raw_d / total, 3),
         "away_win": round(raw_a / total, 3),
-        "source":   "bookmakers",
-        "avg_odds": {
-            "home": round(avg_home, 2),
-            "draw": round(avg_draw, 2),
-            "away": round(avg_away, 2),
-        },
+        "source": "bookmakers",
+        "overround": round((total - 1) * 100, 2),
+        "bookmakers_count": len(home_list),
+        "avg_odds": {"home": round(avg_h, 2), "draw": round(avg_d, 2), "away": round(avg_a, 2)},
     }

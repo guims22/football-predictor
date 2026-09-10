@@ -1,30 +1,103 @@
+"""
+Moteur de prediction : Poisson bivarie (Dixon-Coles) + XGBoost + cotes bookmakers.
+"""
+
 import math
-import pickle
 import os
-import numpy as np
+import pickle
 from typing import Optional
 
-# ─── Chargement du modele XGBoost ────────────────────────────────────────────
+import numpy as np
+
+from models.features import (
+    FEATURE_VERSION,
+    N_FEATURES,
+    build_features,
+    compute_form,
+    compute_h2h,
+    sort_matches,
+    finished_only,
+    filter_team,
+    rest_days,
+    parse_date,
+)
 
 _MODEL_PATH = os.path.join(os.path.dirname(__file__), "xgboost_model.pkl")
+
+# Etat expose par /health : avant, un echec de chargement etait invisible.
+MODEL_STATUS = {
+    "loaded": False,
+    "reason": "non charge",
+    "accuracy": None,
+    "log_loss": None,
+    "trained_at": None,
+    "feature_version": None,
+}
+
 _xgb_model = None
+_ensemble_weights = {"poisson": 0.55, "xgb": 0.45}
+
 
 def _load_xgb():
-    global _xgb_model
-    if _xgb_model is None and os.path.exists(_MODEL_PATH):
-        try:
-            with open(_MODEL_PATH, "rb") as f:
-                data = pickle.load(f)
-                _xgb_model = data["model"]
-                print(f"XGBoost charge (precision: {data.get('accuracy',0)*100:.1f}%)")
-        except Exception as e:
-            print(f"XGBoost non disponible: {e}")
+    """
+    Charge le modele XGBoost.
+
+    CORRECTIF : avant, toute exception ici etait avalee par un except silencieux
+    et l'API repartait en Poisson pur sans le dire. En prod (Railway), xgboost
+    n'etait meme pas dans requirements.txt, donc le modele n'a jamais tourne.
+    """
+    global _xgb_model, _ensemble_weights
+    if _xgb_model is not None:
+        return _xgb_model
+
+    if not os.path.exists(_MODEL_PATH):
+        MODEL_STATUS["reason"] = f"fichier absent : {_MODEL_PATH} (lancer python -m models.train)"
+        return None
+
+    try:
+        import xgboost  # noqa: F401  -- verifie explicitement la dependance
+    except ImportError:
+        MODEL_STATUS["reason"] = "xgboost non installe (pip install -r requirements.txt)"
+        return None
+
+    try:
+        with open(_MODEL_PATH, "rb") as f:
+            data = pickle.load(f)
+    except Exception as e:
+        MODEL_STATUS["reason"] = f"pickle illisible : {e}"
+        return None
+
+    version = data.get("feature_version")
+    if version != FEATURE_VERSION:
+        MODEL_STATUS["reason"] = (
+            f"modele obsolete (features v{version}, code v{FEATURE_VERSION}) -- reentrainer"
+        )
+        return None
+
+    _xgb_model = data["model"]
+    _ensemble_weights = data.get("ensemble_weights", _ensemble_weights)
+    MODEL_STATUS.update({
+        "loaded": True,
+        "reason": "ok",
+        "accuracy": data.get("accuracy"),
+        "log_loss": data.get("log_loss"),
+        "trained_at": data.get("trained_at"),
+        "feature_version": version,
+        "n_samples": data.get("n_samples"),
+        "seasons": data.get("seasons"),
+    })
     return _xgb_model
+
 
 _load_xgb()
 
 
-# ─── Poisson ──────────────────────────────────────────────────────────────────
+# --- Poisson / Dixon-Coles ---------------------------------------------------
+
+LEAGUE_AVG_GOALS = 1.35     # buts par equipe et par match
+HOME_ADVANTAGE = 1.25       # multiplicateur d'attaque a domicile
+DC_RHO = -0.05              # correction Dixon-Coles sur les petits scores
+
 
 def _poisson(lam: float, k: int) -> float:
     if lam <= 0:
@@ -33,308 +106,228 @@ def _poisson(lam: float, k: int) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def _poisson_probs(home_xg: float, away_xg: float, max_goals: int = 7) -> dict:
-    """Calculate full score matrix and H/D/A probabilities via Poisson."""
-    home_xg = max(0.1, home_xg)
-    away_xg = max(0.1, away_xg)
+def _dc_tau(h: int, a: int, lh: float, la: float, rho: float = DC_RHO) -> float:
+    """
+    Correction Dixon-Coles.
+
+    Le Poisson independant sous-estime systematiquement les scores nuls serres
+    (0-0, 1-1) et donc la probabilite du match nul -- exactement la faiblesse
+    qu'avait le modele precedent. Tau recalibre les quatre scores concernes.
+    """
+    if h == 0 and a == 0:
+        return 1 - lh * la * rho
+    if h == 0 and a == 1:
+        return 1 + lh * rho
+    if h == 1 and a == 0:
+        return 1 + la * rho
+    if h == 1 and a == 1:
+        return 1 - rho
+    return 1.0
+
+
+def _score_matrix(home_xg: float, away_xg: float, max_goals: int = 8) -> dict:
+    home_xg = max(0.15, home_xg)
+    away_xg = max(0.15, away_xg)
 
     home_win = draw = away_win = 0.0
-    best_score = "1-1"
-    best_p = 0.0
+    best_score, best_p = "1-1", 0.0
+    total_goals_probs = {}
 
     for h in range(max_goals + 1):
         for a in range(max_goals + 1):
-            p = _poisson(home_xg, h) * _poisson(away_xg, a)
+            p = _poisson(home_xg, h) * _poisson(away_xg, a) * _dc_tau(h, a, home_xg, away_xg)
+            p = max(p, 0.0)
             if p > best_p:
-                best_p = p
-                best_score = f"{h}-{a}"
+                best_p, best_score = p, f"{h}-{a}"
             if h > a:
                 home_win += p
             elif h == a:
                 draw += p
             else:
                 away_win += p
+            total_goals_probs[h + a] = total_goals_probs.get(h + a, 0.0) + p
 
     total = home_win + draw + away_win
-    if total > 0:
-        home_win /= total
-        draw /= total
-        away_win /= total
+    if total <= 0:
+        return {"home_win": 0.33, "draw": 0.34, "away_win": 0.33,
+                "predicted_score": "1-1", "goals_dist": {}}
 
     return {
-        "home_win": round(home_win, 3),
-        "draw": round(draw, 3),
-        "away_win": round(away_win, 3),
+        "home_win": home_win / total,
+        "draw": draw / total,
+        "away_win": away_win / total,
         "predicted_score": best_score,
+        "goals_dist": {k: v / total for k, v in total_goals_probs.items()},
     }
 
 
-# ─── Form calculation ─────────────────────────────────────────────────────────
+def _btts_prob(home_xg: float, away_xg: float) -> float:
+    return (1 - _poisson(home_xg, 0)) * (1 - _poisson(away_xg, 0))
+
+
+def _over_prob(goals_dist: dict, line: float) -> float:
+    return sum(p for total, p in goals_dist.items() if total > line)
+
+
+# --- API publique de calcul de forme (reexport pour les routes) ---------------
 
 def calculate_form(matches: list, team_id: int, venue: str = "all") -> dict:
-    """
-    Calculate weighted team form.
-    venue: 'home' | 'away' | 'all'
-    More recent matches get higher weight (exponential decay).
-    """
-    finished = [m for m in matches if m.get("status") == "FINISHED"]
-
-    # Filter by venue
-    if venue == "home":
-        finished = [m for m in finished if m["homeTeam"]["id"] == team_id]
-    elif venue == "away":
-        finished = [m for m in finished if m["awayTeam"]["id"] == team_id]
-
-    recent = finished[-8:]  # Last 8 matches
-
-    wins = draws = losses = 0
-    goals_scored = goals_conceded = 0
-    clean_sheets = 0
-    weighted_pts = 0.0
-    total_weight = 0.0
-
-    for i, match in enumerate(recent):
-        # More recent = higher weight (last match weight = 1.0)
-        weight = 0.6 + (i / max(len(recent) - 1, 1)) * 0.4
-
-        home_id = match["homeTeam"]["id"]
-        score = match.get("score", {}).get("fullTime", {})
-        hg = score.get("home") or 0
-        ag = score.get("away") or 0
-
-        if home_id == team_id:
-            gs, gc = hg, ag
-        elif match["awayTeam"]["id"] == team_id:
-            gs, gc = ag, hg
-        else:
-            continue
-
-        goals_scored += gs
-        goals_conceded += gc
-        if gc == 0:
-            clean_sheets += 1
-
-        if gs > gc:
-            wins += 1
-            weighted_pts += 3 * weight
-        elif gs == gc:
-            draws += 1
-            weighted_pts += 1 * weight
-        else:
-            losses += 1
-
-        total_weight += 3 * weight  # max possible
-
-    played = wins + draws + losses
-    if played == 0:
-        return {
-            "wins": 0, "draws": 0, "losses": 0,
-            "avg_goals_scored": 1.2, "avg_goals_conceded": 1.2,
-            "form_score": 0.5, "clean_sheets": 0, "played": 0,
-            "xg_attack": 1.2, "xg_defense": 1.2,
-        }
-
-    form_score = weighted_pts / total_weight if total_weight > 0 else 0.5
-    avg_scored = goals_scored / played
-    avg_conceded = goals_conceded / played
-
-    return {
-        "wins": wins,
-        "draws": draws,
-        "losses": losses,
-        "avg_goals_scored": round(avg_scored, 2),
-        "avg_goals_conceded": round(avg_conceded, 2),
-        "form_score": round(form_score, 3),
-        "clean_sheets": clean_sheets,
-        "played": played,
-        "xg_attack": round(avg_scored, 2),
-        "xg_defense": round(avg_conceded, 2),
-    }
+    """Trie chronologiquement puis calcule la forme. Point d'entree des routes."""
+    return compute_form(sort_matches(finished_only(matches)), team_id, venue)
 
 
-def calculate_h2h_summary(h2h_matches: list, home_team_id: int, away_team_id: int) -> dict:
-    home_wins = away_wins = draws = 0
-    home_goals = away_goals = 0
-
-    for match in h2h_matches:
-        if match.get("status") != "FINISHED":
-            continue
-        score = match.get("score", {}).get("fullTime", {})
-        hg = score.get("home") or 0
-        ag = score.get("away") or 0
-        h_id = match["homeTeam"]["id"]
-
-        if h_id == home_team_id:
-            home_goals += hg
-            away_goals += ag
-            if hg > ag:
-                home_wins += 1
-            elif hg == ag:
-                draws += 1
-            else:
-                away_wins += 1
-        else:
-            home_goals += ag
-            away_goals += hg
-            if ag > hg:
-                home_wins += 1
-            elif ag == hg:
-                draws += 1
-            else:
-                away_wins += 1
-
-    total = home_wins + away_wins + draws
-    return {
-        "home_wins": home_wins,
-        "draws": draws,
-        "away_wins": away_wins,
-        "total": total,
-        "avg_goals_home": round(home_goals / total, 2) if total else 0,
-        "avg_goals_away": round(away_goals / total, 2) if total else 0,
-    }
+def calculate_h2h_summary(h2h_matches: list, home_team_id: int, away_team_id: int,
+                          reference_date=None) -> dict:
+    return compute_h2h(h2h_matches, home_team_id, away_team_id, reference_date)
 
 
-# ─── Main prediction ──────────────────────────────────────────────────────────
+def calculate_rest(matches: list, team_id: int, match_date=None) -> float:
+    team_matches = filter_team(sort_matches(finished_only(matches)), team_id, "all")
+    return rest_days(team_matches, match_date)
+
+
+# --- prediction --------------------------------------------------------------
 
 def predict_match(
     home_form: dict,
     away_form: dict,
-    home_form_home: dict,   # form only at home
-    away_form_away: dict,   # form only away
+    home_form_home: dict,
+    away_form_away: dict,
     h2h: Optional[dict] = None,
     home_position: Optional[int] = None,
     away_position: Optional[int] = None,
     league_size: int = 20,
+    home_rest: float = 7.0,
+    away_rest: float = 7.0,
 ) -> dict:
     """
-    Full prediction using:
-    - Poisson distribution on expected goals
-    - Weighted form (home/away specific + overall)
-    - H2H adjustment
-    - League standings factor
+    Prediction complete.
+
+    xG multiplicatifs (force d'attaque x faiblesse defensive adverse x moyenne
+    de ligue), au lieu de la moyenne additive precedente qui ecrasait les ecarts
+    entre grosses et petites equipes.
     """
-    HOME_ADV_GOALS = 0.25   # Home teams score ~0.25 more goals per game
-    HOME_ADV_CONCEDE = 0.15  # Home teams concede ~0.15 fewer goals per game
+    h2h = h2h or {}
 
-    # Expected goals: blend overall form + home/away specific form
-    home_xg_attack = home_form["xg_attack"] * 0.4 + home_form_home["xg_attack"] * 0.6
-    home_xg_defense = home_form["xg_defense"] * 0.4 + home_form_home["xg_defense"] * 0.6
-    away_xg_attack = away_form["xg_attack"] * 0.4 + away_form_away["xg_attack"] * 0.6
-    away_xg_defense = away_form["xg_defense"] * 0.4 + away_form_away["xg_defense"] * 0.6
+    def strength(value: float) -> float:
+        return max(0.25, min(value / LEAGUE_AVG_GOALS, 2.5))
 
-    # Expected goals per team
-    home_xg = (home_xg_attack + away_xg_defense) / 2 + HOME_ADV_GOALS
-    away_xg = (away_xg_attack + home_xg_defense) / 2 - HOME_ADV_CONCEDE
+    # melange forme globale (40%) et forme specifique domicile/exterieur (60%)
+    h_att = strength(home_form["xg_attack"] * 0.4 + home_form_home["xg_attack"] * 0.6)
+    h_def = strength(home_form["xg_defense"] * 0.4 + home_form_home["xg_defense"] * 0.6)
+    a_att = strength(away_form["xg_attack"] * 0.4 + away_form_away["xg_attack"] * 0.6)
+    a_def = strength(away_form["xg_defense"] * 0.4 + away_form_away["xg_defense"] * 0.6)
 
-    # League position adjustment
+    home_xg = h_att * a_def * LEAGUE_AVG_GOALS * HOME_ADVANTAGE
+    away_xg = a_att * h_def * LEAGUE_AVG_GOALS
+
+    # classement : desormais reellement transmis par les routes
     if home_position and away_position and league_size > 0:
-        home_rank_factor = (league_size - home_position) / league_size * 0.15
-        away_rank_factor = (league_size - away_position) / league_size * 0.15
-        home_xg += home_rank_factor * 0.3
-        away_xg += away_rank_factor * 0.3
+        gap = (away_position - home_position) / league_size   # -1 .. +1
+        home_xg *= 1 + gap * 0.12
+        away_xg *= 1 - gap * 0.12
 
-    # H2H adjustment
-    if h2h and h2h["total"] >= 3:
-        total = h2h["total"]
-        h2h_home_rate = h2h["home_wins"] / total
-        h2h_away_rate = h2h["away_wins"] / total
-        home_xg *= (1 + (h2h_home_rate - 0.45) * 0.15)
-        away_xg *= (1 + (h2h_away_rate - 0.30) * 0.15)
+    # H2H pondere par anciennete
+    if h2h.get("total", 0) >= 3:
+        home_xg *= 1 + (h2h.get("w_home_rate", 0.45) - 0.45) * 0.15
+        away_xg *= 1 + (h2h.get("w_away_rate", 0.30) - 0.30) * 0.15
 
-    home_xg = max(0.3, min(home_xg, 4.0))
-    away_xg = max(0.3, min(away_xg, 4.0))
+    # fatigue : moins de 4 jours de repos penalise
+    if home_rest < 4:
+        home_xg *= 0.95
+    if away_rest < 4:
+        away_xg *= 0.95
 
-    # Poisson probabilities
-    probs = _poisson_probs(home_xg, away_xg)
+    home_xg = max(0.25, min(home_xg, 4.5))
+    away_xg = max(0.25, min(away_xg, 4.5))
 
-    # ── Ensemble XGBoost + Poisson ───────────────────────────────────────────
+    probs = _score_matrix(home_xg, away_xg)
+    method = "Poisson Dixon-Coles"
+
     xgb = _load_xgb()
-    method = "Poisson"
-
     if xgb is not None:
         try:
-            features = np.array([[
-                home_form["form_score"], home_form["avg_goals_scored"], home_form["avg_goals_conceded"], home_form.get("clean_sheets", 0) / max(home_form["played"], 1),
-                away_form["form_score"], away_form["avg_goals_scored"], away_form["avg_goals_conceded"], away_form.get("clean_sheets", 0) / max(away_form["played"], 1),
-                home_form_home["form_score"], home_form_home["avg_goals_scored"], home_form_home["avg_goals_conceded"],
-                away_form_away["form_score"], away_form_away["avg_goals_scored"], away_form_away["avg_goals_conceded"],
-                home_form["form_score"] - away_form["form_score"],
-                home_form["avg_goals_scored"] - away_form["avg_goals_conceded"],
-                away_form["avg_goals_scored"] - home_form["avg_goals_conceded"],
-            ]])
-            xgb_proba = xgb.predict_proba(features)[0]  # [home_win, draw, away_win]
-            # Ensemble: 55% Poisson + 45% XGBoost
-            W_POISSON, W_XGB = 0.55, 0.45
-            final_home = probs["home_win"] * W_POISSON + xgb_proba[0] * W_XGB
-            final_draw  = probs["draw"]     * W_POISSON + xgb_proba[1] * W_XGB
-            final_away  = probs["away_win"] * W_POISSON + xgb_proba[2] * W_XGB
-            # Renormalise
-            total = final_home + final_draw + final_away
-            probs["home_win"] = round(final_home / total, 3)
-            probs["draw"]     = round(final_draw  / total, 3)
-            probs["away_win"] = round(final_away  / total, 3)
+            features = np.array([build_features(
+                home_form, away_form, home_form_home, away_form_away,
+                h2h, home_rest, away_rest,
+            )], dtype=float)
+            if features.shape[1] != N_FEATURES:
+                raise ValueError(f"shape {features.shape} incompatible")
+
+            xgb_proba = xgb.predict_proba(features)[0]   # [domicile, nul, exterieur]
+            wp = _ensemble_weights.get("poisson", 0.55)
+            wx = _ensemble_weights.get("xgb", 0.45)
+
+            blended = [
+                probs["home_win"] * wp + float(xgb_proba[0]) * wx,
+                probs["draw"] * wp + float(xgb_proba[1]) * wx,
+                probs["away_win"] * wp + float(xgb_proba[2]) * wx,
+            ]
+            s = sum(blended)
+            probs["home_win"], probs["draw"], probs["away_win"] = [b / s for b in blended]
             method = "Ensemble XGBoost+Poisson"
         except Exception as e:
-            print(f"XGBoost prediction failed, using Poisson only: {e}")
+            # on n'avale plus l'erreur en silence : elle remonte dans la reponse
+            method = f"Poisson seul (XGBoost indisponible : {e})"
 
-    # Additional bet types
     btts = _btts_prob(home_xg, away_xg)
-    over_2_5 = _over_under_prob(home_xg, away_xg, 2.5)
-    over_1_5 = _over_under_prob(home_xg, away_xg, 1.5)
-
-    confidence = round(max(probs["home_win"], probs["draw"], probs["away_win"]) * 100, 1)
+    dist = probs["goals_dist"]
 
     return {
-        "home_win": probs["home_win"],
-        "draw": probs["draw"],
-        "away_win": probs["away_win"],
+        "home_win": round(probs["home_win"], 3),
+        "draw": round(probs["draw"], 3),
+        "away_win": round(probs["away_win"], 3),
         "predicted_score": probs["predicted_score"],
-        "confidence": confidence,
+        "confidence": round(max(probs["home_win"], probs["draw"], probs["away_win"]) * 100, 1),
         "home_xg": round(home_xg, 2),
         "away_xg": round(away_xg, 2),
         "btts": round(btts, 3),
-        "over_2_5": round(over_2_5, 3),
-        "over_1_5": round(over_1_5, 3),
+        "over_1_5": round(_over_prob(dist, 1.5), 3),
+        "over_2_5": round(_over_prob(dist, 2.5), 3),
+        "over_3_5": round(_over_prob(dist, 3.5), 3),
         "method": method,
+        "model_loaded": MODEL_STATUS["loaded"],
     }
 
 
 def blend_with_odds(prediction: dict, odds: dict) -> dict:
     """
-    Blend prediction with bookmaker implied probabilities.
-    Weights: 35% Poisson/XGBoost + 65% Market odds
-    Market odds are the strongest predictor available.
+    Fusion avec les probabilites implicites des bookmakers (35% modele / 65% marche).
+
+    Ajoute la detection de value bet : ecart entre notre probabilite avant fusion
+    et celle du marche. C'est la seule information reellement exploitable pour
+    parier -- suivre le marche ne bat jamais le marche.
     """
-    W_MODEL = 0.35
-    W_ODDS  = 0.65
+    W_MODEL, W_ODDS = 0.35, 0.65
+    model_probs = {
+        "home_win": prediction["home_win"],
+        "draw": prediction["draw"],
+        "away_win": prediction["away_win"],
+    }
 
-    blended_home = prediction["home_win"] * W_MODEL + odds["home_win"] * W_ODDS
-    blended_draw = prediction["draw"]     * W_MODEL + odds["draw"]     * W_ODDS
-    blended_away = prediction["away_win"] * W_MODEL + odds["away_win"] * W_ODDS
+    blended = {k: model_probs[k] * W_MODEL + odds[k] * W_ODDS for k in model_probs}
+    total = sum(blended.values())
 
-    total = blended_home + blended_draw + blended_away
-    prediction["home_win"] = round(blended_home / total, 3)
-    prediction["draw"]     = round(blended_draw  / total, 3)
-    prediction["away_win"] = round(blended_away  / total, 3)
-    prediction["confidence"] = round(max(prediction["home_win"], prediction["draw"], prediction["away_win"]) * 100, 1)
+    for k in model_probs:
+        prediction[k] = round(blended[k] / total, 3)
+
+    prediction["confidence"] = round(
+        max(prediction["home_win"], prediction["draw"], prediction["away_win"]) * 100, 1
+    )
     prediction["method"] = "Ensemble+Bookmakers"
-    prediction["odds"] = odds["avg_odds"]
+    prediction["odds"] = odds.get("avg_odds")
+
+    value = {}
+    for k, odds_key in (("home_win", "home"), ("draw", "draw"), ("away_win", "away")):
+        book_odd = (odds.get("avg_odds") or {}).get(odds_key)
+        if book_odd:
+            edge = model_probs[k] - odds[k]
+            value[k] = {
+                "model_prob": round(model_probs[k], 3),
+                "market_prob": round(odds[k], 3),
+                "edge": round(edge, 3),
+                "expected_value": round(model_probs[k] * book_odd - 1, 3),
+                "value_bet": bool(edge > 0.05 and model_probs[k] * book_odd > 1.05),
+            }
+    prediction["value_analysis"] = value
     return prediction
-
-
-def _btts_prob(home_xg: float, away_xg: float) -> float:
-    """Probability that BOTH teams score at least 1 goal."""
-    home_scores = 1 - _poisson(home_xg, 0)
-    away_scores = 1 - _poisson(away_xg, 0)
-    return home_scores * away_scores
-
-
-def _over_under_prob(home_xg: float, away_xg: float, line: float) -> float:
-    """Probability that total goals > line."""
-    over = 0.0
-    threshold = int(line) + 1
-    for total in range(threshold, 15):
-        for h in range(total + 1):
-            a = total - h
-            over += _poisson(home_xg, h) * _poisson(away_xg, a)
-    return min(over, 0.99)
